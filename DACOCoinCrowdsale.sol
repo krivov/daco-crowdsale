@@ -267,11 +267,135 @@ contract MintableToken is StandardToken, Ownable {
   }
 }
 
-contract DACOToken is MintableToken {
+
+/**
+ * @title Pausable
+ * @dev Base contract which allows children to implement an emergency stop mechanism.
+ */
+contract Pausable is Ownable {
+  event Pause();
+  event Unpause();
+
+  bool public paused = false;
+
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is not paused.
+   */
+  modifier whenNotPaused() {
+    require(!paused);
+    _;
+  }
+
+  /**
+   * @dev Modifier to make a function callable only when the contract is paused.
+   */
+  modifier whenPaused() {
+    require(paused);
+    _;
+  }
+
+  /**
+   * @dev called by the owner to pause, triggers stopped state
+   */
+  function pause() onlyOwner whenNotPaused public {
+    paused = true;
+    Pause();
+  }
+
+  /**
+   * @dev called by the owner to unpause, returns to normal state
+   */
+  function unpause() onlyOwner whenPaused public {
+    paused = false;
+    Unpause();
+  }
+}
+
+contract PausableToken is StandardToken, Pausable {
+
+  function transfer(address _to, uint256 _value) public whenNotPaused returns (bool) {
+    return super.transfer(_to, _value);
+  }
+
+  function transferFrom(address _from, address _to, uint256 _value) public whenNotPaused returns (bool) {
+    return super.transferFrom(_from, _to, _value);
+  }
+
+  function approve(address _spender, uint256 _value) public whenNotPaused returns (bool) {
+    return super.approve(_spender, _value);
+  }
+
+  function increaseApproval(address _spender, uint _addedValue) public whenNotPaused returns (bool success) {
+    return super.increaseApproval(_spender, _addedValue);
+  }
+
+  function decreaseApproval(address _spender, uint _subtractedValue) public whenNotPaused returns (bool success) {
+    return super.decreaseApproval(_spender, _subtractedValue);
+  }
+}
+
+
+contract DACOToken is MintableToken, PausableToken {
   string public constant name = "DACO Coin";
   string public constant symbol = "DACO";
   uint8 public constant decimals = 18;
 }
+
+
+
+/**
+ * @title RefundVault
+ * @dev This contract is used for storing funds while a crowdsale
+ * is in progress. Supports refunding the money if crowdsale fails,
+ * and forwarding it if crowdsale is successful.
+ */
+contract RefundVault is Ownable {
+  using SafeMath for uint256;
+
+  enum State { Active, Refunding, Closed }
+
+  mapping (address => uint256) public deposited;
+  address public wallet;
+  State public state;
+
+  event Closed();
+  event RefundsEnabled();
+  event Refunded(address indexed beneficiary, uint256 weiAmount);
+
+  function RefundVault(address _wallet) {
+    require(_wallet != 0x0);
+    wallet = _wallet;
+    state = State.Active;
+  }
+
+  function deposit(address investor) onlyOwner public payable {
+    require(state == State.Active);
+    deposited[investor] = deposited[investor].add(msg.value);
+  }
+
+  function close() onlyOwner public {
+    require(state == State.Active);
+    state = State.Closed;
+    Closed();
+    wallet.transfer(this.balance);
+  }
+
+  function enableRefunds() onlyOwner public {
+    require(state == State.Active);
+    state = State.Refunding;
+    RefundsEnabled();
+  }
+
+  function refund(address investor) public {
+    require(state == State.Refunding);
+    uint256 depositedValue = deposited[investor];
+    deposited[investor] = 0;
+    investor.transfer(depositedValue);
+    Refunded(investor, depositedValue);
+  }
+}
+
 
 /**
  * @title Crowdsale
@@ -299,6 +423,9 @@ contract DACOCoinCrowdsale is Ownable {
 
   // DACO token emission
   uint256 public tokenEmission;
+
+  // refund vault used to hold funds while crowdsale is running
+  RefundVault public vault;
 
   // true for finalised crowdsale
   bool public isFinalized;
@@ -400,6 +527,7 @@ contract DACOCoinCrowdsale is Ownable {
     isFinalized = false;
 
     token = new DACOToken();
+    vault = new RefundVault(wallet);
   }
 
   // fallback function can be used to buy tokens
@@ -483,6 +611,17 @@ contract DACOCoinCrowdsale is Ownable {
     return true;
   }
 
+  // set token on pause
+  function pauseToken() external onlyOwner {
+    require(!isFinalized);
+    DACOToken(token).pause();
+  }
+
+  // unset token's pause
+  function unpauseToken() external onlyOwner {
+    DACOToken(token).unpause();
+  }
+
   // @return true if main sale event has ended
   function mainSaleHasEnded() external constant returns (bool) {
     return now > mainSaleEndTime;
@@ -495,7 +634,8 @@ contract DACOCoinCrowdsale is Ownable {
 
   // send ether to the fund collection wallet
   function forwardFunds() internal {
-    wallet.transfer(msg.value);
+    //wallet.transfer(msg.value);
+    vault.deposit.value(msg.value)(msg.sender);
   }
 
   // we want to be able to check all bonuses in already deployed contract
@@ -555,6 +695,13 @@ contract DACOCoinCrowdsale is Ownable {
     }
   }
 
+  // if crowdsale is unsuccessful, investors can claim refunds here
+  function claimRefund() public {
+    require(isFinalized);
+    require(!goalReached());
+    vault.refund(msg.sender);
+  }
+
   function goalReached() public constant returns (bool) {
     return weiRaised >= goal;
   }
@@ -569,6 +716,10 @@ contract DACOCoinCrowdsale is Ownable {
     uint256 minterBenefit = tokenEmission.mul(2).div(100);
     if (goalReached()) {
       token.mint(tokenWallet, minterBenefit);
+      vault.close();
+      //token.finishMinting();
+    } else {
+      vault.enableRefunds();
     }
 
     FinalisedCrowdsale(totalSupply, minterBenefit);
